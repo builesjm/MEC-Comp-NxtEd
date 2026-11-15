@@ -1,0 +1,204 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+int motor1Pin1 = 27, motor1Pin2 = 26, enable1Pin = 14;
+int motor2Pin1 = 25, motor2Pin2 = 33, enable2Pin = 32;
+const int freq = 5000, resolution = 8;
+const int FULL_SPEED = 255;
+
+const bool RIGHT_FLIP = false;
+const bool LEFT_FLIP  = false;
+
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 19;
+const int SERVO_PIN = 18;
+Servo gripper;
+const int GRIP_OPEN = 110;
+const int GRIP_CLOSED = 30;
+
+const int DETECT_CM   = 12;
+const int LANE_TIME   = 5000;
+const int SHIFT_TIME  = 600;
+const int TURN_90     = 450;
+const int FIRST_LANE_BLIND_MS = 1500;
+
+WebServer server(80);
+volatile bool sweeping = false;
+bool manualDriving = false;
+unsigned long lastCmd = 0;
+String state = "MANUAL";
+
+void setSide(int pinA, int pinB, int dir, bool flip) {
+  if (flip) dir = -dir;
+  digitalWrite(pinA, dir > 0 ? HIGH : LOW);
+  digitalWrite(pinB, dir < 0 ? HIGH : LOW);
+}
+void setRight(int dir) { setSide(motor1Pin1, motor1Pin2, dir, RIGHT_FLIP); }
+void setLeft(int dir)  { setSide(motor2Pin1, motor2Pin2, dir, LEFT_FLIP); }
+
+void forward()   { setRight(1);  setLeft(1);  }
+void backward()  { setRight(-1); setLeft(-1); }
+void spinRight() { setRight(-1); setLeft(1);  }
+void spinLeft()  { setRight(1);  setLeft(-1); }
+void motorsOff() { setRight(0);  setLeft(0);  }
+
+float readCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long us = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (us == 0) return 999;
+  return us * 0.0343 / 2.0;
+}
+
+bool waitMs(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    server.handleClient();
+    if (!sweeping) return false;
+    delay(5);
+  }
+  return true;
+}
+
+bool moveFor(void (*move)(), unsigned long ms) {
+  move();
+  bool ok = waitMs(ms);
+  motorsOff();
+  return ok && waitMs(300);
+}
+
+void runSweep() {
+  bool turnRightNext = true;
+  bool firstLane = true;
+
+  while (sweeping) {
+    unsigned long t0 = millis();
+    int hits = 0;
+    bool found = false;
+    forward();
+
+    while (sweeping && millis() - t0 < LANE_TIME) {
+      server.handleClient();
+      bool blind = firstLane && (millis() - t0 < FIRST_LANE_BLIND_MS);
+      if (!blind) hits = (readCm() < DETECT_CM) ? hits + 1 : 0;
+      if (hits >= 2) { found = true; break; }
+      delay(40);
+    }
+    motorsOff();
+    if (!sweeping) return;
+
+    if (found) {
+      gripper.write(GRIP_CLOSED);
+      delay(700);
+      sweeping = false;
+      state = "GRABBED, drive it to the drop spot";
+      return;
+    }
+
+    void (*turn)() = turnRightNext ? spinRight : spinLeft;
+    if (!moveFor(turn, TURN_90)) return;
+    if (!moveFor(forward, SHIFT_TIME)) return;
+    if (!moveFor(turn, TURN_90)) return;
+    turnRightNext = !turnRightNext;
+    firstLane = false;
+  }
+}
+
+const char PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+body{font-family:sans-serif;text-align:center;margin:0;padding:12px;touch-action:none;user-select:none}
+button{font-size:22px;padding:22px 0;margin:5px;width:28%;border-radius:12px;border:1px solid #888}
+.wide{width:60%}
+#st{font-size:20px;margin:10px}
+</style></head><body>
+<div id="st">...</div>
+<div><button id="f">Fwd</button></div>
+<div><button id="l">Left</button><button id="s">Stop</button><button id="r">Right</button></div>
+<div><button id="b">Back</button></div>
+<div><button class="wide" onclick="send('W')">START SWEEP</button></div>
+<div><button onclick="send('G')">Close arm</button><button onclick="send('O')">Release</button></div>
+<script>
+let timer=null;
+function send(c){fetch('/cmd?c='+c).catch(()=>{});}
+function hold(id,c){
+  const b=document.getElementById(id);
+  const start=e=>{e.preventDefault();clearInterval(timer);send(c);timer=setInterval(()=>send(c),150);};
+  const end=e=>{e.preventDefault();clearInterval(timer);send('S');};
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',end);
+  b.addEventListener('pointerleave',end);
+  b.addEventListener('pointercancel',end);
+}
+hold('f','F');hold('b','B');hold('l','L');hold('r','R');
+document.getElementById('s').onclick=()=>send('X');
+setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>document.getElementById('st').textContent=t).catch(()=>{}),500);
+</script></body></html>
+)HTML";
+
+void handleCmd() {
+  String c = server.arg("c");
+  server.send(200, "text/plain", "ok");
+  lastCmd = millis();
+
+  if (c == "W") {
+    if (!sweeping) { sweeping = true; manualDriving = false; state = "SWEEPING"; }
+    return;
+  }
+  if (c == "X") {
+    sweeping = false; manualDriving = false; motorsOff(); state = "MANUAL";
+    return;
+  }
+  if (c == "G") { gripper.write(GRIP_CLOSED); return; }
+  if (c == "O") { gripper.write(GRIP_OPEN); state = "MANUAL"; return; }
+
+  if (sweeping) { sweeping = false; motorsOff(); state = "MANUAL"; return; }
+
+  manualDriving = true;
+  if (c == "F") forward();
+  else if (c == "B") backward();
+  else if (c == "L") spinLeft();
+  else if (c == "R") spinRight();
+  else motorsOff();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(motor1Pin1, OUTPUT); pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT); pinMode(motor2Pin2, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  gripper.setPeriodHertz(50);
+  gripper.attach(SERVO_PIN, 500, 2500);
+  gripper.write(GRIP_OPEN);
+
+  ledcAttach(enable1Pin, freq, resolution);
+  ledcAttach(enable2Pin, freq, resolution);
+  ledcWrite(enable1Pin, FULL_SPEED);
+  ledcWrite(enable2Pin, FULL_SPEED);
+
+  WiFi.softAP("SandRover", "rover1234");
+  Serial.print("Open http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
+  server.on("/cmd", handleCmd);
+  server.on("/status", []() { server.send(200, "text/plain", state); });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (sweeping) {
+    runSweep();
+  } else if (manualDriving && millis() - lastCmd > 400) {
+    motorsOff();
+    manualDriving = false;
+  }
+}
